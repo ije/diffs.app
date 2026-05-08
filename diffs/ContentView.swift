@@ -467,7 +467,7 @@ struct SelectableCodeTextView: NSViewRepresentable {
                 attributes: gutterMarkerAttributes
             ))
             lineNumbers.append(NSAttributedString(
-                string: "\(row.number)",
+                string: row.number == 0 ? "" : "\(row.number)",
                 attributes: gutterAttributes
             ))
             let lineContent = NSMutableAttributedString(string: row.text, attributes: [
@@ -607,14 +607,8 @@ struct ContentView: View {
         let lineNumberColor: Color
         let oldLines: [DiffCodeLine]
         let newLines: [DiffCodeLine]
-    }
-
-    private struct DemoDiffColumn {
-        let changedLineNumbers: Set<Int>
-        let accentColor: Color
-        let backgroundColor: Color?
-        let gutterBackgroundColor: Color
-        let inlineHighlights: [Int: [String]]
+        let deleteCount: Int
+        let insertCount: Int
     }
 
     @State private var selectedTheme: ThemeChoice = .light
@@ -656,40 +650,6 @@ struct ContentView: View {
         "}",
     ]
 
-    private static func ranges(for fragments: [String], in line: String) -> [NSRange] {
-        let nsLine = line as NSString
-        return fragments.compactMap { fragment in
-            let range = nsLine.range(of: fragment)
-            return range.location == NSNotFound ? nil : range
-        }
-    }
-
-    private static func buildDiffColumn(
-        lines: [String],
-        grammar: Grammar,
-        column: DemoDiffColumn
-    ) throws -> [DiffCodeLine] {
-        var stack: StateStackImpl?
-        var output: [DiffCodeLine] = []
-
-        for (index, line) in lines.enumerated() {
-            let tokenized = try grammar.tokenizeLine2(lineText: line, prevState: stack, timeLimitMs: 0)
-            let lineNumber = index + 1
-            output.append(DiffCodeLine(
-                number: lineNumber,
-                text: line,
-                tokens: Array(tokenized.tokens),
-                backgroundColor: column.changedLineNumbers.contains(lineNumber) ? column.backgroundColor : nil,
-                gutterBackgroundColor: column.changedLineNumbers.contains(lineNumber) ? column.gutterBackgroundColor : nil,
-                accentColor: column.changedLineNumbers.contains(lineNumber) ? column.accentColor : nil,
-                emphasizedRanges: ranges(for: column.inlineHighlights[lineNumber] ?? [], in: line)
-            ))
-            stack = tokenized.ruleStack
-        }
-
-        return output
-    }
-
     private static func loadPreview(theme: ThemeChoice) -> LoadedPreview? {
         var pal: [String] = []
         var bgRGBA = TMRGBA(tmHex: "#101010")!
@@ -697,6 +657,8 @@ struct ContentView: View {
         var lineNo = Color.white.opacity(0.45)
         var oldLines: [DiffCodeLine] = []
         var newLines: [DiffCodeLine] = []
+        var deleteCount = 0
+        var insertCount = 0
 
         do {
             let gramURL = Bundle.main.url(forResource: "rust", withExtension: "json")!
@@ -737,40 +699,113 @@ struct ContentView: View {
             ) else {
                 return nil
             }
-            oldLines = try buildDiffColumn(
-                lines: demoOldRustLines,
-                grammar: grammar,
-                column: DemoDiffColumn(
-                    changedLineNumbers: [4, 6, 7, 10, 11],
-                    accentColor: Color(red: 1, green: 0.21, blue: 0.26),
-                    backgroundColor: Color(red: 0.98, green: 0.45, blue: 0.40).opacity(0.16),
-                    gutterBackgroundColor: Color(red: 0.98, green: 0.45, blue: 0.40).opacity(0.08),
-                    inlineHighlights: [
-                        4: ["What is", "name?"],
-                        6: ["unwrap"],
-                        7: ["{}"],
-                        10: ["x", "y"],
-                        11: ["return", "x", "y"]
-                    ]
-                )
-            )
-            newLines = try buildDiffColumn(
-                lines: demoNewRustLines,
-                grammar: grammar,
-                column: DemoDiffColumn(
-                    changedLineNumbers: [4, 6, 7, 10, 11],
-                    accentColor: Color(red: 0.09, green: 0.72, blue: 0.61),
-                    backgroundColor: Color(red: 0.30, green: 0.85, blue: 0.74).opacity(0.15),
-                    gutterBackgroundColor: Color(red: 0.30, green: 0.85, blue: 0.74).opacity(0.08),
-                    inlineHighlights: [
-                        4: ["Enter", "name:"],
-                        6: ["expect", "read error"],
-                        7: ["!"],
-                        10: ["a", "b"],
-                        11: ["a", "b"]
-                    ]
-                )
-            )
+            let diffLines = CodeDiff.computeLines(old: demoOldRustLines, new: demoNewRustLines)
+
+            let deleteAccent = Color(red: 1, green: 0.21, blue: 0.26)
+            let deleteBg = Color(red: 0.98, green: 0.45, blue: 0.40).opacity(0.16)
+            let deleteGutterBg = Color(red: 0.98, green: 0.45, blue: 0.40).opacity(0.08)
+
+            let insertAccent = Color(red: 0.09, green: 0.72, blue: 0.61)
+            let insertBg = Color(red: 0.30, green: 0.85, blue: 0.74).opacity(0.15)
+            let insertGutterBg = Color(red: 0.30, green: 0.85, blue: 0.74).opacity(0.08)
+
+            var oldStack: StateStackImpl? = nil
+            var newStack: StateStackImpl? = nil
+            var oldOutput: [DiffCodeLine] = []
+            var newOutput: [DiffCodeLine] = []
+            var pendingDeletes: [DiffLine] = []
+
+            func flushDeletes() throws {
+                for del in pendingDeletes {
+                    let tokenized = try grammar.tokenizeLine2(lineText: del.text, prevState: oldStack, timeLimitMs: 0)
+                    oldOutput.append(DiffCodeLine(
+                        number: del.oldLineNumber!,
+                        text: del.text,
+                        tokens: Array(tokenized.tokens),
+                        backgroundColor: deleteBg,
+                        gutterBackgroundColor: deleteGutterBg,
+                        accentColor: deleteAccent,
+                        emphasizedRanges: []
+                    ))
+                    oldStack = tokenized.ruleStack
+                    newOutput.append(spacer())
+                }
+                pendingDeletes.removeAll()
+            }
+
+            func spacer() -> DiffCodeLine {
+                DiffCodeLine(number: 0, text: "", tokens: [], backgroundColor: nil, gutterBackgroundColor: nil, accentColor: nil, emphasizedRanges: [])
+            }
+
+            for entry in diffLines {
+                switch entry.operation {
+                case .equal:
+                    try flushDeletes()
+                    let tokenized = try grammar.tokenizeLine2(lineText: entry.text, prevState: oldStack, timeLimitMs: 0)
+                    let line = DiffCodeLine(
+                        number: entry.oldLineNumber!,
+                        text: entry.text,
+                        tokens: Array(tokenized.tokens),
+                        backgroundColor: nil,
+                        gutterBackgroundColor: nil,
+                        accentColor: nil,
+                        emphasizedRanges: []
+                    )
+                    oldOutput.append(line)
+                    newOutput.append(line)
+                    oldStack = tokenized.ruleStack
+                    newStack = tokenized.ruleStack
+                case .delete:
+                    pendingDeletes.append(entry)
+                case .insert:
+                    if let del = pendingDeletes.first {
+                        pendingDeletes.removeFirst()
+                        let oldTok = try grammar.tokenizeLine2(lineText: del.text, prevState: oldStack, timeLimitMs: 0)
+                        let newTok = try grammar.tokenizeLine2(lineText: entry.text, prevState: newStack, timeLimitMs: 0)
+                        let inline = CodeDiff.computeInline(oldLine: del.text, newLine: entry.text)
+                        oldOutput.append(DiffCodeLine(
+                            number: del.oldLineNumber!,
+                            text: del.text,
+                            tokens: Array(oldTok.tokens),
+                            backgroundColor: deleteBg,
+                            gutterBackgroundColor: deleteGutterBg,
+                            accentColor: deleteAccent,
+                            emphasizedRanges: inline.oldRemoved.map { NSRange(location: $0.start, length: $0.length) }
+                        ))
+                        oldStack = oldTok.ruleStack
+                        newOutput.append(DiffCodeLine(
+                            number: entry.newLineNumber!,
+                            text: entry.text,
+                            tokens: Array(newTok.tokens),
+                            backgroundColor: insertBg,
+                            gutterBackgroundColor: insertGutterBg,
+                            accentColor: insertAccent,
+                            emphasizedRanges: inline.newAdded.map { NSRange(location: $0.start, length: $0.length) }
+                        ))
+                        newStack = newTok.ruleStack
+                    } else {
+                        try flushDeletes()
+                        let tokenized = try grammar.tokenizeLine2(lineText: entry.text, prevState: newStack, timeLimitMs: 0)
+                        oldOutput.append(spacer())
+                        newOutput.append(DiffCodeLine(
+                            number: entry.newLineNumber!,
+                            text: entry.text,
+                            tokens: Array(tokenized.tokens),
+                            backgroundColor: insertBg,
+                            gutterBackgroundColor: insertGutterBg,
+                            accentColor: insertAccent,
+                            emphasizedRanges: []
+                        ))
+                        newStack = tokenized.ruleStack
+                    }
+                }
+            }
+            try flushDeletes()
+
+            oldLines = oldOutput
+            newLines = newOutput
+            deleteCount = diffLines.filter { $0.operation == .delete }.count
+            insertCount = diffLines.filter { $0.operation == .insert }.count
         } catch {
             print("ContentView bootstrap failed for theme \(theme.resourceName): \(error)")
             return nil
@@ -783,7 +818,9 @@ struct ContentView: View {
             editorForegroundRGBA: fgRGBA,
             lineNumberColor: lineNo,
             oldLines: oldLines,
-            newLines: newLines
+            newLines: newLines,
+            deleteCount: deleteCount,
+            insertCount: insertCount
         )
     }
 
@@ -881,8 +918,8 @@ struct ContentView: View {
                         HStack(alignment: .center) {
                             diffColumnTitle("main.rs", color: Color(red: 0, green: 159 / 255, blue: 1))
                             Spacer()
-                            diffStat(value: "-5", color: Color(red: 1, green: 0.29, blue: 0.31))
-                            diffStat(value: "+5", color: Color(red: 0.11, green: 0.79, blue: 0.67))
+                            diffStat(value: "-\(preview.deleteCount)", color: Color(red: 1, green: 0.29, blue: 0.31))
+                            diffStat(value: "+\(preview.insertCount)", color: Color(red: 0.11, green: 0.79, blue: 0.67))
                         }
                         .padding(.bottom, 8)
 
