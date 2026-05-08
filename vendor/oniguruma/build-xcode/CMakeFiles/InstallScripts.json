@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/x/Downloads/diffs/vendor/oniguruma/build-xcode/cmake_install.cmake",
+		"/Users/x/Downloads/diffs/vendor/oniguruma/build-xcode/test/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
