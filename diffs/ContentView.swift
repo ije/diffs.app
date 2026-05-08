@@ -121,9 +121,11 @@ private func tmAttributedLine(
     colorPalette: [String],
     defaultForeground: TMRGBA,
     editorBackground: TMRGBA,
-    font: NSFont
+    font: NSFont,
+    highlightedRanges: [NSRange] = []
 ) -> NSAttributedString {
     let attributed = NSMutableAttributedString()
+    var utf16Offset = 0
     for piece in tmPieces(
         forLine: sampleLine,
         tokens: tokens,
@@ -131,25 +133,42 @@ private func tmAttributedLine(
         defaultForeground: defaultForeground,
         editorBackground: editorBackground
     ) {
+        let pieceLength = piece.0.utf16.count
+        let pieceRange = NSRange(location: utf16Offset, length: pieceLength)
+        let backgroundColor = highlightedRanges.contains { NSIntersectionRange($0, pieceRange).length > 0 }
+            ? NSColor(Color.white.opacity(0.7))
+            : .clear
         attributed.append(NSAttributedString(
             string: piece.0,
             attributes: [
                 .font: font,
-                .foregroundColor: NSColor(piece.1)
+                .foregroundColor: NSColor(piece.1),
+                .backgroundColor: backgroundColor
             ]
         ))
+        utf16Offset += pieceLength
     }
     return attributed
+}
+
+struct DiffCodeLine {
+    let number: Int
+    let text: String
+    let tokens: [UInt32]
+    let backgroundColor: Color?
+    let accentColor: Color?
+    let emphasizedRanges: [NSRange]
 }
 
 struct SelectableCodeTextView: NSViewRepresentable {
     let lineHeight: CGFloat = 24
     let lineNumberSpacing: CGFloat = 8
-    let highlightedLines: [(line: String, tokens: [UInt32])]
+    let highlightedLines: [DiffCodeLine]
     let colorPalette: [String]
     let defaultForeground: TMRGBA
     let editorBackground: TMRGBA
     let lineNumberColor: Color
+    let lineNumberTint: Color?
 
     func makeNSView(context: Context) -> NSView {
         let container = NSView()
@@ -251,23 +270,41 @@ struct SelectableCodeTextView: NSViewRepresentable {
         lineNumberParagraphStyle.maximumLineHeight = lineHeight
         let lineNumberAttributes: [NSAttributedString.Key: Any] = [
             .font: lineNumberFont,
-            .foregroundColor: NSColor(lineNumberColor),
+            .foregroundColor: NSColor(lineNumberTint ?? lineNumberColor),
             .paragraphStyle: lineNumberParagraphStyle
         ]
 
         for (index, row) in highlightedLines.enumerated() {
             lineNumbers.append(NSAttributedString(
-                string: "\(index + 1)",
-                attributes: lineNumberAttributes
+                string: "\(row.number)",
+                attributes: [
+                    .font: lineNumberFont,
+                    .foregroundColor: NSColor(row.accentColor ?? lineNumberTint ?? lineNumberColor),
+                    .paragraphStyle: lineNumberParagraphStyle
+                ]
             ))
-            content.append(tmAttributedLine(
-                sampleLine: row.line,
+            let lineContent = NSMutableAttributedString(string: row.text, attributes: [
+                .font: codeFont,
+                .foregroundColor: NSColor(Color(tmRGBA: defaultForeground)),
+                .paragraphStyle: codeParagraphStyle
+            ])
+            lineContent.setAttributedString(tmAttributedLine(
+                sampleLine: row.text,
                 tokens: row.tokens,
                 colorPalette: colorPalette,
                 defaultForeground: defaultForeground,
                 editorBackground: editorBackground,
-                font: codeFont
+                font: codeFont,
+                highlightedRanges: row.emphasizedRanges
             ))
+            if let backgroundColor = row.backgroundColor {
+                lineContent.addAttribute(
+                    .backgroundColor,
+                    value: NSColor(backgroundColor),
+                    range: NSRange(location: 0, length: lineContent.length)
+                )
+            }
+            content.append(lineContent)
             if index < highlightedLines.count - 1 {
                 lineNumbers.append(NSAttributedString(string: "\n", attributes: lineNumberAttributes))
                 content.append(NSAttributedString(string: "\n", attributes: [
@@ -349,7 +386,15 @@ struct ContentView: View {
         let editorBackgroundRGBA: TMRGBA
         let editorForegroundRGBA: TMRGBA
         let lineNumberColor: Color
-        let highlightedLines: [(line: String, tokens: [UInt32])]
+        let oldLines: [DiffCodeLine]
+        let newLines: [DiffCodeLine]
+    }
+
+    private struct DemoDiffColumn {
+        let changedLineNumbers: Set<Int>
+        let accentColor: Color
+        let backgroundColor: Color
+        let inlineHighlights: [Int: [String]]
     }
 
     @State private var selectedTheme: ThemeChoice = .light
@@ -360,7 +405,7 @@ struct ContentView: View {
     }
 
     /// Multi-line sample; `tokenizeLine2` state is carried line-to-line like VS Code.
-    private static let demoRustLines: [String] = [
+    private static let demoOldRustLines: [String] = [
         "use std::io;",
         "",
         "fn main() {",
@@ -375,12 +420,61 @@ struct ContentView: View {
         "}",
     ]
 
+    private static let demoNewRustLines: [String] = [
+        "use std::io;",
+        "",
+        "fn main() {",
+        "    println!(\"Enter your name:\");",
+        "    let mut name = String::new();",
+        "    io::stdin().read_line(&mut name).expect(\"read error\");",
+        "    println!(\"Hello, {}!\", name.trim());",
+        "}",
+        "",
+        "fn add(a: i32, b: i32) -> i32 {",
+        "    a + b",
+        "}",
+    ]
+
+    private static func ranges(for fragments: [String], in line: String) -> [NSRange] {
+        let nsLine = line as NSString
+        return fragments.compactMap { fragment in
+            let range = nsLine.range(of: fragment)
+            return range.location == NSNotFound ? nil : range
+        }
+    }
+
+    private static func buildDiffColumn(
+        lines: [String],
+        grammar: Grammar,
+        column: DemoDiffColumn
+    ) throws -> [DiffCodeLine] {
+        var stack: StateStackImpl?
+        var output: [DiffCodeLine] = []
+
+        for (index, line) in lines.enumerated() {
+            let tokenized = try grammar.tokenizeLine2(lineText: line, prevState: stack, timeLimitMs: 0)
+            let lineNumber = index + 1
+            output.append(DiffCodeLine(
+                number: lineNumber,
+                text: line,
+                tokens: Array(tokenized.tokens),
+                backgroundColor: column.changedLineNumbers.contains(lineNumber) ? column.backgroundColor : nil,
+                accentColor: column.changedLineNumbers.contains(lineNumber) ? column.accentColor : nil,
+                emphasizedRanges: ranges(for: column.inlineHighlights[lineNumber] ?? [], in: line)
+            ))
+            stack = tokenized.ruleStack
+        }
+
+        return output
+    }
+
     private static func loadPreview(theme: ThemeChoice) -> LoadedPreview? {
         var pal: [String] = []
         var bgRGBA = TMRGBA(tmHex: "#101010")!
         var fgRGBA = TMRGBA(tmHex: "#FFFFFF")!
         var lineNo = Color.white.opacity(0.45)
-        var linesOut: [(String, [UInt32])] = []
+        var oldLines: [DiffCodeLine] = []
+        var newLines: [DiffCodeLine] = []
 
         do {
             let gramURL = Bundle.main.url(forResource: "rust", withExtension: "json")!
@@ -421,12 +515,38 @@ struct ContentView: View {
             ) else {
                 return nil
             }
-            var stack: StateStackImpl?
-            for line in demoRustLines {
-                let r = try grammar.tokenizeLine2(lineText: line, prevState: stack, timeLimitMs: 0)
-                linesOut.append((line, Array(r.tokens)))
-                stack = r.ruleStack
-            }
+            oldLines = try buildDiffColumn(
+                lines: demoOldRustLines,
+                grammar: grammar,
+                column: DemoDiffColumn(
+                    changedLineNumbers: [4, 6, 7, 10, 11],
+                    accentColor: Color(red: 1, green: 0.29, blue: 0.31),
+                    backgroundColor: Color(red: 1, green: 0.38, blue: 0.34).opacity(0.14),
+                    inlineHighlights: [
+                        4: ["What is", "name?"],
+                        6: ["unwrap"],
+                        7: ["{}"],
+                        10: ["x", "y"],
+                        11: ["return", "x", "y"]
+                    ]
+                )
+            )
+            newLines = try buildDiffColumn(
+                lines: demoNewRustLines,
+                grammar: grammar,
+                column: DemoDiffColumn(
+                    changedLineNumbers: [4, 6, 7, 10, 11],
+                    accentColor: Color(red: 0.11, green: 0.79, blue: 0.67),
+                    backgroundColor: Color(red: 0.2, green: 0.86, blue: 0.73).opacity(0.14),
+                    inlineHighlights: [
+                        4: ["Enter", "name:"],
+                        6: ["expect", "read error"],
+                        7: ["!"],
+                        10: ["a", "b"],
+                        11: ["a", "b"]
+                    ]
+                )
+            )
         } catch {
             print("ContentView bootstrap failed for theme \(theme.resourceName): \(error)")
             return nil
@@ -438,8 +558,27 @@ struct ContentView: View {
             editorBackgroundRGBA: bgRGBA,
             editorForegroundRGBA: fgRGBA,
             lineNumberColor: lineNo,
-            highlightedLines: linesOut
+            oldLines: oldLines,
+            newLines: newLines
         )
+    }
+
+    private func diffColumnTitle(_ title: String, color: Color) -> some View {
+        HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(color, lineWidth: 2)
+                .frame(width:16, height:16)
+            Text(title)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(Color(tmRGBA: preview?.editorForegroundRGBA ?? TMRGBA(tmHex: "#111111")!))
+            Spacer()
+        }
+    }
+
+    private func diffStat(value: String, color: Color) -> some View {
+        Text(value)
+            .font(.system(size: 14, weight: .semibold, design: .monospaced))
+            .foregroundStyle(color)
     }
 
     private var nextTheme: ThemeChoice {
@@ -508,29 +647,54 @@ struct ContentView: View {
                 .ignoresSafeArea()
 
             VStack(alignment: .leading, spacing: 0) {
-                if let preview, !preview.highlightedLines.isEmpty {
-                    SelectableCodeTextView(
-                        highlightedLines: preview.highlightedLines,
-                        colorPalette: preview.palette,
-                        defaultForeground: preview.editorForegroundRGBA,
-                        editorBackground: preview.editorBackgroundRGBA,
-                        lineNumberColor: preview.lineNumberColor
-                    )
+                if let preview, !preview.oldLines.isEmpty, !preview.newLines.isEmpty {
+                    VStack(spacing: 0) {
+                        HStack(alignment: .center) {
+                            diffColumnTitle("main.rs", color: Color.blue)
+                            Spacer()
+                            diffStat(value: "-5", color: Color(red: 1, green: 0.29, blue: 0.31))
+                            diffStat(value: "+5", color: Color(red: 0.11, green: 0.79, blue: 0.67))
+                        }
+                        .padding(.bottom, 8)
+
+                        HStack(spacing: 0) {
+                            SelectableCodeTextView(
+                                highlightedLines: preview.oldLines,
+                                colorPalette: preview.palette,
+                                defaultForeground: preview.editorForegroundRGBA,
+                                editorBackground: preview.editorBackgroundRGBA,
+                                lineNumberColor: preview.lineNumberColor,
+                                lineNumberTint: nil
+                            )
+
+
+                            SelectableCodeTextView(
+                                highlightedLines: preview.newLines,
+                                colorPalette: preview.palette,
+                                defaultForeground: preview.editorForegroundRGBA,
+                                editorBackground: preview.editorBackgroundRGBA,
+                                lineNumberColor: preview.lineNumberColor,
+                                lineNumberTint: nil
+                            )
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 } else {
                     Text("Failed to load grammar or theme resources.")
                         .foregroundStyle(.red)
                         .padding(16)
                 }
             }
-            .padding(8)
+            .padding(12)
 
             if let preview {
                 VStack {
+                    Spacer()
+
                     HStack {
                         Spacer()
                         floatingThemeButton(preview: preview)
                     }
-                    Spacer()
                 }
                 .padding(8)
             }
@@ -539,7 +703,7 @@ struct ContentView: View {
             preview = Self.loadPreview(theme: newTheme)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .frame(minWidth: 560, minHeight: 200)
+        .frame(minWidth: 980, minHeight: 420)
     }
 }
 
