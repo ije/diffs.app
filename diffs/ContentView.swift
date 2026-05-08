@@ -122,7 +122,8 @@ private func tmAttributedLine(
     defaultForeground: TMRGBA,
     editorBackground: TMRGBA,
     font: NSFont,
-    highlightedRanges: [NSRange] = []
+    highlightedRanges: [NSRange] = [],
+    baselineOffset: CGFloat = 0
 ) -> NSAttributedString {
     let attributed = NSMutableAttributedString()
     var utf16Offset = 0
@@ -143,7 +144,8 @@ private func tmAttributedLine(
             attributes: [
                 .font: font,
                 .foregroundColor: NSColor(piece.1),
-                .backgroundColor: backgroundColor
+                .backgroundColor: backgroundColor,
+                .baselineOffset: baselineOffset
             ]
         ))
         utf16Offset += pieceLength
@@ -156,13 +158,91 @@ struct DiffCodeLine {
     let text: String
     let tokens: [UInt32]
     let backgroundColor: Color?
+    let gutterBackgroundColor: Color?
     let accentColor: Color?
     let emphasizedRanges: [NSRange]
 }
 
+struct GutterRowStyle {
+    let backgroundColor: NSColor?
+    let accentColor: NSColor?
+}
+
+final class GutterTextView: NSTextView {
+    var rowStyles: [GutterRowStyle] = []
+    var rowHeight: CGFloat = 24
+    var drawsMarker = false
+    var markerWidth: CGFloat = 4
+    var markerSegmentHeight: CGFloat = 5
+    var markerSegmentGap: CGFloat = 4
+
+    private var deletionThreshold: CGFloat { 0.5 }
+
+    override func drawBackground(in rect: NSRect) {
+        super.drawBackground(in: rect)
+
+        let visibleMinY = max(0, floor(rect.minY / rowHeight))
+        let visibleMaxY = ceil(rect.maxY / rowHeight)
+        let startIndex = Int(visibleMinY)
+        let endIndex = min(rowStyles.count, Int(visibleMaxY))
+
+        for index in startIndex..<endIndex {
+            let row = rowStyles[index]
+            let rowRect = NSRect(x: 0, y: CGFloat(index) * rowHeight, width: bounds.width, height: rowHeight)
+
+            if let backgroundColor = row.backgroundColor {
+                backgroundColor.setFill()
+                rowRect.fill()
+            }
+
+            if drawsMarker, let accentColor = row.accentColor, row.backgroundColor != nil {
+                accentColor.setFill()
+                if accentColor.redComponent > deletionThreshold {
+                    let blockStart = contiguousDeletionBlockStart(at: index)
+                    let blockEnd = contiguousDeletionBlockEnd(at: index)
+                    let blockMinY = CGFloat(blockStart) * rowHeight
+                    let blockMaxY = CGFloat(blockEnd + 1) * rowHeight
+                    var y = ceil(blockMinY / 2) * 2
+                    while y < blockMaxY {
+                        let segmentHeight = min(1, blockMaxY - y)
+                        NSRect(x: 0, y: y, width: markerWidth, height: segmentHeight).fill()
+                        y += 2
+                    }
+                } else {
+                    NSRect(x: 0, y: rowRect.minY, width: markerWidth, height: rowRect.height).fill()
+                }
+            }
+        }
+    }
+
+    private func contiguousDeletionBlockStart(at index: Int) -> Int {
+        var current = index
+        while current > 0, isDeletionRow(rowStyles[current]), isDeletionRow(rowStyles[current - 1]) {
+            current -= 1
+        }
+        return current
+    }
+
+    private func contiguousDeletionBlockEnd(at index: Int) -> Int {
+        var current = index
+        while current + 1 < rowStyles.count, isDeletionRow(rowStyles[current]), isDeletionRow(rowStyles[current + 1]) {
+            current += 1
+        }
+        return current
+    }
+
+    private func isDeletionRow(_ row: GutterRowStyle) -> Bool {
+        guard row.backgroundColor != nil, let accentColor = row.accentColor else { return false }
+        return accentColor.redComponent > deletionThreshold
+    }
+}
+
 struct SelectableCodeTextView: NSViewRepresentable {
-    let lineHeight: CGFloat = 24
-    let lineNumberSpacing: CGFloat = 8
+    let lineHeight: CGFloat = 28
+    let lineNumberSpacing: CGFloat = 2
+    let gutterPadding: CGFloat = 14
+    let gutterMarkerWidth: CGFloat = 4
+    let gutterDividerWidth: CGFloat = 1
     let highlightedLines: [DiffCodeLine]
     let colorPalette: [String]
     let defaultForeground: TMRGBA
@@ -196,32 +276,64 @@ struct SelectableCodeTextView: NSViewRepresentable {
         )
         textView.string = ""
 
-        let lineNumberView = NSTextView()
+        let lineNumberView = GutterTextView()
         lineNumberView.isEditable = false
         lineNumberView.isSelectable = false
-        lineNumberView.drawsBackground = false
+        lineNumberView.drawsBackground = true
         lineNumberView.backgroundColor = .clear
         lineNumberView.textContainer?.lineFragmentPadding = 0
+        lineNumberView.textContainerInset = NSSize(width: gutterPadding, height: 0)
         lineNumberView.isHorizontallyResizable = false
         lineNumberView.isVerticallyResizable = true
         lineNumberView.textContainer?.widthTracksTextView = true
         lineNumberView.textContainer?.containerSize = NSSize(width: 32, height: CGFloat.greatestFiniteMagnitude)
+        lineNumberView.rowHeight = lineHeight
+
+        let gutterMarkerView = GutterTextView()
+        gutterMarkerView.isEditable = false
+        gutterMarkerView.isSelectable = false
+        gutterMarkerView.drawsBackground = true
+        gutterMarkerView.backgroundColor = .clear
+        gutterMarkerView.textContainer?.lineFragmentPadding = 0
+        gutterMarkerView.textContainerInset = NSSize(width: 0, height: 0)
+        gutterMarkerView.isHorizontallyResizable = false
+        gutterMarkerView.isVerticallyResizable = true
+        gutterMarkerView.textContainer?.widthTracksTextView = true
+        gutterMarkerView.textContainer?.containerSize = NSSize(width: gutterMarkerWidth, height: CGFloat.greatestFiniteMagnitude)
+        gutterMarkerView.rowHeight = lineHeight
+        gutterMarkerView.drawsMarker = true
+        gutterMarkerView.markerWidth = gutterMarkerWidth
+
+        let gutterMarkerScrollView = NSScrollView()
+        gutterMarkerScrollView.borderType = .noBorder
+        gutterMarkerScrollView.hasVerticalScroller = false
+        gutterMarkerScrollView.hasHorizontalScroller = false
+        gutterMarkerScrollView.drawsBackground = false
+        gutterMarkerScrollView.backgroundColor = .clear
+        gutterMarkerScrollView.documentView = gutterMarkerView
+        gutterMarkerScrollView.translatesAutoresizingMaskIntoConstraints = false
 
         let lineNumberScrollView = NSScrollView()
         lineNumberScrollView.borderType = .noBorder
         lineNumberScrollView.hasVerticalScroller = false
         lineNumberScrollView.hasHorizontalScroller = false
         lineNumberScrollView.drawsBackground = false
+        lineNumberScrollView.backgroundColor = .clear
         lineNumberScrollView.documentView = lineNumberView
         lineNumberScrollView.translatesAutoresizingMaskIntoConstraints = false
         lineNumberScrollView.contentView.postsBoundsChangedNotifications = true
 
         scrollView.documentView = textView
         scrollView.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(gutterMarkerScrollView)
         container.addSubview(lineNumberScrollView)
         container.addSubview(scrollView)
         NSLayoutConstraint.activate([
-            lineNumberScrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            gutterMarkerScrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            gutterMarkerScrollView.topAnchor.constraint(equalTo: container.topAnchor),
+            gutterMarkerScrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            gutterMarkerScrollView.widthAnchor.constraint(equalToConstant: gutterMarkerWidth),
+            lineNumberScrollView.leadingAnchor.constraint(equalTo: gutterMarkerScrollView.trailingAnchor),
             lineNumberScrollView.topAnchor.constraint(equalTo: container.topAnchor),
             lineNumberScrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             scrollView.leadingAnchor.constraint(equalTo: lineNumberScrollView.trailingAnchor, constant: lineNumberSpacing),
@@ -233,18 +345,20 @@ struct SelectableCodeTextView: NSViewRepresentable {
         lineNumberWidthConstraint.isActive = true
 
         context.coordinator.codeTextView = textView
+        context.coordinator.gutterMarkerView = gutterMarkerView
         context.coordinator.lineNumberView = lineNumberView
         context.coordinator.lineNumberScrollView = lineNumberScrollView
         context.coordinator.lineNumberWidthConstraint = lineNumberWidthConstraint
-        syncScroll(codeTextView: textView, lineNumberView: lineNumberView)
-        updateTextViews(codeTextView: textView, lineNumberView: lineNumberView, coordinator: context.coordinator)
+        syncScroll(codeTextView: textView, gutterMarkerView: gutterMarkerView, lineNumberView: lineNumberView)
+        updateTextViews(codeTextView: textView, gutterMarkerView: gutterMarkerView, lineNumberView: lineNumberView, coordinator: context.coordinator)
         return container
     }
 
     func updateNSView(_ container: NSView, context: Context) {
         guard let codeTextView = context.coordinator.codeTextView,
+              let gutterMarkerView = context.coordinator.gutterMarkerView,
               let lineNumberView = context.coordinator.lineNumberView else { return }
-        updateTextViews(codeTextView: codeTextView, lineNumberView: lineNumberView, coordinator: context.coordinator)
+        updateTextViews(codeTextView: codeTextView, gutterMarkerView: gutterMarkerView, lineNumberView: lineNumberView, coordinator: context.coordinator)
     }
 
     func makeCoordinator() -> Coordinator {
@@ -253,13 +367,17 @@ struct SelectableCodeTextView: NSViewRepresentable {
 
     private func updateTextViews(
         codeTextView: NSTextView,
-        lineNumberView: NSTextView,
+        gutterMarkerView: GutterTextView,
+        lineNumberView: GutterTextView,
         coordinator: Coordinator
     ) {
-        let codeFont = NSFont.monospacedSystemFont(ofSize: 16, weight: .regular)
-        let lineNumberFont = NSFont.monospacedSystemFont(ofSize: 16, weight: .regular)
+        let codeFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        let lineNumberFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        let codeBaselineOffset = baselineOffset(for: codeFont)
+        let lineNumberBaselineOffset = baselineOffset(for: lineNumberFont)
         let lineNumberWidth = lineNumberGutterWidth(lineCount: highlightedLines.count, font: lineNumberFont)
         let content = NSMutableAttributedString()
+        let gutterMarkers = NSMutableAttributedString()
         let lineNumbers = NSMutableAttributedString()
         let codeParagraphStyle = NSMutableParagraphStyle()
         codeParagraphStyle.minimumLineHeight = lineHeight
@@ -271,22 +389,41 @@ struct SelectableCodeTextView: NSViewRepresentable {
         let lineNumberAttributes: [NSAttributedString.Key: Any] = [
             .font: lineNumberFont,
             .foregroundColor: NSColor(lineNumberTint ?? lineNumberColor),
-            .paragraphStyle: lineNumberParagraphStyle
+            .paragraphStyle: lineNumberParagraphStyle,
+            .baselineOffset: lineNumberBaselineOffset
         ]
+        let gutterRows = highlightedLines.map {
+            GutterRowStyle(
+                backgroundColor: $0.gutterBackgroundColor.map(NSColor.init),
+                accentColor: $0.accentColor.map(NSColor.init)
+            )
+        }
 
         for (index, row) in highlightedLines.enumerated() {
+            let gutterMarkerAttributes: [NSAttributedString.Key: Any] = [
+                .font: lineNumberFont,
+                .paragraphStyle: lineNumberParagraphStyle,
+                .baselineOffset: lineNumberBaselineOffset
+            ]
+            let gutterAttributes: [NSAttributedString.Key: Any] = [
+                .font: lineNumberFont,
+                .foregroundColor: NSColor(row.accentColor ?? lineNumberTint ?? lineNumberColor),
+                .paragraphStyle: lineNumberParagraphStyle,
+                .baselineOffset: lineNumberBaselineOffset
+            ]
+            gutterMarkers.append(NSAttributedString(
+                string: " ",
+                attributes: gutterMarkerAttributes
+            ))
             lineNumbers.append(NSAttributedString(
                 string: "\(row.number)",
-                attributes: [
-                    .font: lineNumberFont,
-                    .foregroundColor: NSColor(row.accentColor ?? lineNumberTint ?? lineNumberColor),
-                    .paragraphStyle: lineNumberParagraphStyle
-                ]
+                attributes: gutterAttributes
             ))
             let lineContent = NSMutableAttributedString(string: row.text, attributes: [
                 .font: codeFont,
                 .foregroundColor: NSColor(Color(tmRGBA: defaultForeground)),
-                .paragraphStyle: codeParagraphStyle
+                .paragraphStyle: codeParagraphStyle,
+                .baselineOffset: codeBaselineOffset
             ])
             lineContent.setAttributedString(tmAttributedLine(
                 sampleLine: row.text,
@@ -295,7 +432,8 @@ struct SelectableCodeTextView: NSViewRepresentable {
                 defaultForeground: defaultForeground,
                 editorBackground: editorBackground,
                 font: codeFont,
-                highlightedRanges: row.emphasizedRanges
+                highlightedRanges: row.emphasizedRanges,
+                baselineOffset: codeBaselineOffset
             ))
             if let backgroundColor = row.backgroundColor {
                 lineContent.addAttribute(
@@ -306,6 +444,7 @@ struct SelectableCodeTextView: NSViewRepresentable {
             }
             content.append(lineContent)
             if index < highlightedLines.count - 1 {
+                gutterMarkers.append(NSAttributedString(string: "\n", attributes: lineNumberAttributes))
                 lineNumbers.append(NSAttributedString(string: "\n", attributes: lineNumberAttributes))
                 content.append(NSAttributedString(string: "\n", attributes: [
                     .font: codeFont,
@@ -316,17 +455,27 @@ struct SelectableCodeTextView: NSViewRepresentable {
 
         content.addAttribute(.paragraphStyle, value: codeParagraphStyle, range: NSRange(location: 0, length: content.length))
         codeTextView.textStorage?.setAttributedString(content)
+        gutterMarkerView.rowStyles = gutterRows
+        gutterMarkerView.textStorage?.setAttributedString(gutterMarkers)
+        gutterMarkerView.needsDisplay = true
+        lineNumberView.rowStyles = gutterRows
         lineNumberView.textStorage?.setAttributedString(lineNumbers)
+        lineNumberView.needsDisplay = true
         coordinator.lineNumberWidthConstraint?.constant = lineNumberWidth
 
         resizeTextView(codeTextView)
+        resizeTextView(gutterMarkerView, fixedWidth: gutterMarkerWidth)
         resizeTextView(lineNumberView, fixedWidth: lineNumberWidth)
     }
 
     private func lineNumberGutterWidth(lineCount: Int, font: NSFont) -> CGFloat {
         let digitCount = String(max(1, lineCount)).count
         let charWidth = ceil(("0" as NSString).size(withAttributes: [.font: font]).width)
-        return CGFloat(digitCount) * charWidth + lineNumberSpacing
+        return CGFloat(digitCount) * charWidth + gutterPadding * 2
+    }
+
+    private func baselineOffset(for font: NSFont) -> CGFloat {
+        max(0, floor((lineHeight - font.ascender + font.descender) / 2))
     }
 
     private func resizeTextView(_ textView: NSTextView, fixedWidth: CGFloat? = nil) {
@@ -342,14 +491,19 @@ struct SelectableCodeTextView: NSViewRepresentable {
         textView.minSize = NSSize(width: width, height: height)
     }
 
-    private func syncScroll(codeTextView: NSTextView, lineNumberView: NSTextView) {
+    private func syncScroll(codeTextView: NSTextView, gutterMarkerView: NSTextView, lineNumberView: NSTextView) {
         NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification,
             object: codeTextView.enclosingScrollView?.contentView,
             queue: .main
         ) { _ in
             guard let clipView = codeTextView.enclosingScrollView?.contentView else { return }
+            guard let gutterMarkerClipView = gutterMarkerView.enclosingScrollView?.contentView else { return }
             guard let lineNumberClipView = lineNumberView.enclosingScrollView?.contentView else { return }
+            var gutterMarkerPoint = gutterMarkerClipView.bounds.origin
+            gutterMarkerPoint.y = clipView.bounds.origin.y
+            gutterMarkerClipView.scroll(to: gutterMarkerPoint)
+            gutterMarkerView.enclosingScrollView?.reflectScrolledClipView(gutterMarkerClipView)
             var point = lineNumberClipView.bounds.origin
             point.y = clipView.bounds.origin.y
             lineNumberClipView.scroll(to: point)
@@ -359,7 +513,8 @@ struct SelectableCodeTextView: NSViewRepresentable {
 
     final class Coordinator {
         weak var codeTextView: NSTextView?
-        weak var lineNumberView: NSTextView?
+        weak var gutterMarkerView: GutterTextView?
+        weak var lineNumberView: GutterTextView?
         weak var lineNumberScrollView: NSScrollView?
         var lineNumberWidthConstraint: NSLayoutConstraint?
     }
@@ -393,7 +548,8 @@ struct ContentView: View {
     private struct DemoDiffColumn {
         let changedLineNumbers: Set<Int>
         let accentColor: Color
-        let backgroundColor: Color
+        let backgroundColor: Color?
+        let gutterBackgroundColor: Color
         let inlineHighlights: [Int: [String]]
     }
 
@@ -459,6 +615,7 @@ struct ContentView: View {
                 text: line,
                 tokens: Array(tokenized.tokens),
                 backgroundColor: column.changedLineNumbers.contains(lineNumber) ? column.backgroundColor : nil,
+                gutterBackgroundColor: column.changedLineNumbers.contains(lineNumber) ? column.gutterBackgroundColor : nil,
                 accentColor: column.changedLineNumbers.contains(lineNumber) ? column.accentColor : nil,
                 emphasizedRanges: ranges(for: column.inlineHighlights[lineNumber] ?? [], in: line)
             ))
@@ -494,7 +651,7 @@ struct ContentView: View {
                let lineRGBA = TMRGBA(tmHex: hex) {
                 let visible = lineRGBA.composited(on: bgRGBA)
                 lineNo = if visible.contrastDistance(from: bgRGBA) < 0.4 {
-                    Color(tmRGBA: fgRGBA).opacity(0.55)
+                    Color(tmRGBA: fgRGBA).opacity(theme == .light ? 0.5 : 0.55)
                 } else {
                     Color(tmRGBA: visible)
                 }
@@ -520,8 +677,9 @@ struct ContentView: View {
                 grammar: grammar,
                 column: DemoDiffColumn(
                     changedLineNumbers: [4, 6, 7, 10, 11],
-                    accentColor: Color(red: 1, green: 0.29, blue: 0.31),
-                    backgroundColor: Color(red: 1, green: 0.38, blue: 0.34).opacity(0.14),
+                    accentColor: Color(red: 1, green: 0.21, blue: 0.26),
+                    backgroundColor: Color(red: 0.98, green: 0.45, blue: 0.40).opacity(0.16),
+                    gutterBackgroundColor: Color(red: 0.98, green: 0.45, blue: 0.40).opacity(0.08),
                     inlineHighlights: [
                         4: ["What is", "name?"],
                         6: ["unwrap"],
@@ -536,8 +694,9 @@ struct ContentView: View {
                 grammar: grammar,
                 column: DemoDiffColumn(
                     changedLineNumbers: [4, 6, 7, 10, 11],
-                    accentColor: Color(red: 0.11, green: 0.79, blue: 0.67),
-                    backgroundColor: Color(red: 0.2, green: 0.86, blue: 0.73).opacity(0.14),
+                    accentColor: Color(red: 0.09, green: 0.72, blue: 0.61),
+                    backgroundColor: Color(red: 0.30, green: 0.85, blue: 0.74).opacity(0.15),
+                    gutterBackgroundColor: Color(red: 0.30, green: 0.85, blue: 0.74).opacity(0.08),
                     inlineHighlights: [
                         4: ["Enter", "name:"],
                         6: ["expect", "read error"],
@@ -565,11 +724,11 @@ struct ContentView: View {
 
     private func diffColumnTitle(_ title: String, color: Color) -> some View {
         HStack(spacing: 10) {
-            RoundedRectangle(cornerRadius: 4)
+            RoundedRectangle(cornerRadius: 6)
                 .stroke(color, lineWidth: 2)
                 .frame(width:16, height:16)
             Text(title)
-                .font(.system(size: 16, weight: .semibold))
+                .font(.system(size: 14, weight: .regular))
                 .foregroundStyle(Color(tmRGBA: preview?.editorForegroundRGBA ?? TMRGBA(tmHex: "#111111")!))
             Spacer()
         }
@@ -577,7 +736,7 @@ struct ContentView: View {
 
     private func diffStat(value: String, color: Color) -> some View {
         Text(value)
-            .font(.system(size: 14, weight: .semibold, design: .monospaced))
+            .font(.system(size: 14, weight: .regular, design: .monospaced))
             .foregroundStyle(color)
     }
 
@@ -591,7 +750,7 @@ struct ContentView: View {
             selectedTheme = nextTheme
         } label: {
             Image(systemName: selectedTheme == .light ? "moon.stars.fill" : "sun.max.fill")
-                .font(.system(size: 16, weight: .semibold))
+                .font(.system(size: 16, weight: .regular))
                 .frame(width: 40, height: 40)
                 .contentShape(Circle())
         }
