@@ -183,8 +183,9 @@ final class GutterTextView: NSTextView {
 
         let visibleMinY = max(0, floor(rect.minY / rowHeight))
         let visibleMaxY = ceil(rect.maxY / rowHeight)
-        let startIndex = Int(visibleMinY)
+        let startIndex = min(max(0, Int(visibleMinY)), rowStyles.count)
         let endIndex = min(rowStyles.count, Int(visibleMaxY))
+        guard startIndex < endIndex else { return }
 
         for index in startIndex..<endIndex {
             let row = rowStyles[index]
@@ -237,6 +238,51 @@ final class GutterTextView: NSTextView {
     }
 }
 
+final class ScrollCoordinator {
+    private struct Entry {
+        weak var scrollView: NSScrollView?
+        var observer: NSObjectProtocol
+    }
+    private var entries: [Entry] = []
+    private var isSyncing = false
+
+    func register(_ scrollView: NSScrollView) {
+        entries.removeAll { $0.scrollView == nil }
+        guard !entries.contains(where: { $0.scrollView === scrollView }) else { return }
+        let observer = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.sync(from: scrollView)
+        }
+        entries.append(Entry(scrollView: scrollView, observer: observer))
+    }
+
+    func unregister(_ scrollView: NSScrollView) {
+        if let idx = entries.firstIndex(where: { $0.scrollView === scrollView }) {
+            NotificationCenter.default.removeObserver(entries[idx].observer)
+            entries.remove(at: idx)
+        }
+    }
+
+    private func sync(from source: NSScrollView) {
+        guard !isSyncing else { return }
+        isSyncing = true
+        entries.removeAll { $0.scrollView == nil }
+        let yOffset = source.contentView.bounds.origin.y
+        for entry in entries {
+            guard let scrollView = entry.scrollView, scrollView !== source else { continue }
+            var point = scrollView.contentView.bounds.origin
+            point.y = yOffset
+            scrollView.contentView.scroll(to: point)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+        isSyncing = false
+    }
+}
+
 struct SelectableCodeTextView: NSViewRepresentable {
     let lineHeight: CGFloat = 28
     let lineNumberSpacing: CGFloat = 2
@@ -249,6 +295,7 @@ struct SelectableCodeTextView: NSViewRepresentable {
     let editorBackground: TMRGBA
     let lineNumberColor: Color
     let lineNumberTint: Color?
+    var scrollCoordinator: ScrollCoordinator?
 
     func makeNSView(context: Context) -> NSView {
         let container = NSView()
@@ -349,7 +396,11 @@ struct SelectableCodeTextView: NSViewRepresentable {
         context.coordinator.lineNumberView = lineNumberView
         context.coordinator.lineNumberScrollView = lineNumberScrollView
         context.coordinator.lineNumberWidthConstraint = lineNumberWidthConstraint
-        syncScroll(codeTextView: textView, gutterMarkerView: gutterMarkerView, lineNumberView: lineNumberView)
+        context.coordinator.scrollCoordinator = scrollCoordinator
+        if let sc = scrollCoordinator {
+            sc.register(scrollView)
+        }
+        syncScroll(codeTextView: textView, gutterMarkerView: gutterMarkerView, lineNumberView: lineNumberView, coordinator: context.coordinator)
         updateTextViews(codeTextView: textView, gutterMarkerView: gutterMarkerView, lineNumberView: lineNumberView, coordinator: context.coordinator)
         return container
     }
@@ -491,8 +542,8 @@ struct SelectableCodeTextView: NSViewRepresentable {
         textView.minSize = NSSize(width: width, height: height)
     }
 
-    private func syncScroll(codeTextView: NSTextView, gutterMarkerView: NSTextView, lineNumberView: NSTextView) {
-        NotificationCenter.default.addObserver(
+    private func syncScroll(codeTextView: NSTextView, gutterMarkerView: NSTextView, lineNumberView: NSTextView, coordinator: Coordinator) {
+        let token = NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification,
             object: codeTextView.enclosingScrollView?.contentView,
             queue: .main
@@ -509,6 +560,17 @@ struct SelectableCodeTextView: NSViewRepresentable {
             lineNumberClipView.scroll(to: point)
             lineNumberView.enclosingScrollView?.reflectScrolledClipView(lineNumberClipView)
         }
+        coordinator.boundsObserver = token
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        if let observer = coordinator.boundsObserver {
+            NotificationCenter.default.removeObserver(observer)
+            coordinator.boundsObserver = nil
+        }
+        if let scrollView = coordinator.codeTextView?.enclosingScrollView {
+            coordinator.scrollCoordinator?.unregister(scrollView)
+        }
     }
 
     final class Coordinator {
@@ -517,6 +579,8 @@ struct SelectableCodeTextView: NSViewRepresentable {
         weak var lineNumberView: GutterTextView?
         weak var lineNumberScrollView: NSScrollView?
         var lineNumberWidthConstraint: NSLayoutConstraint?
+        var scrollCoordinator: ScrollCoordinator?
+        var boundsObserver: NSObjectProtocol?
     }
 }
 
@@ -555,6 +619,7 @@ struct ContentView: View {
 
     @State private var selectedTheme: ThemeChoice = .light
     @State private var preview: LoadedPreview?
+    @State private var scrollCoordinator = ScrollCoordinator()
 
     init() {
         _preview = State(initialValue: Self.loadPreview(theme: .light))
@@ -828,7 +893,8 @@ struct ContentView: View {
                                 defaultForeground: preview.editorForegroundRGBA,
                                 editorBackground: preview.editorBackgroundRGBA,
                                 lineNumberColor: preview.lineNumberColor,
-                                lineNumberTint: nil
+                                lineNumberTint: nil,
+                                scrollCoordinator: scrollCoordinator
                             )
 
 
@@ -838,7 +904,8 @@ struct ContentView: View {
                                 defaultForeground: preview.editorForegroundRGBA,
                                 editorBackground: preview.editorBackgroundRGBA,
                                 lineNumberColor: preview.lineNumberColor,
-                                lineNumberTint: nil
+                                lineNumberTint: nil,
+                                scrollCoordinator: scrollCoordinator
                             )
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
