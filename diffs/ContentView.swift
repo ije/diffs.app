@@ -724,9 +724,14 @@ struct ContentView: View {
 
     private func diffColumnTitle(_ title: String, color: Color) -> some View {
         HStack(spacing: 10) {
-            RoundedRectangle(cornerRadius: 6)
+            RoundedRectangle(cornerRadius: 5)
                 .stroke(color, lineWidth: 2)
-                .frame(width:16, height:16)
+                .frame(width: 16, height: 16)
+                .overlay {
+                    Circle()
+                        .fill(color)
+                        .frame(width: 6, height: 6)
+                }
             Text(title)
                 .font(.system(size: 14, weight: .regular))
                 .foregroundStyle(Color(tmRGBA: preview?.editorForegroundRGBA ?? TMRGBA(tmHex: "#111111")!))
@@ -809,7 +814,7 @@ struct ContentView: View {
                 if let preview, !preview.oldLines.isEmpty, !preview.newLines.isEmpty {
                     VStack(spacing: 0) {
                         HStack(alignment: .center) {
-                            diffColumnTitle("main.rs", color: Color.blue)
+                            diffColumnTitle("main.rs", color: Color(red: 0, green: 159 / 255, blue: 1))
                             Spacer()
                             diffStat(value: "-5", color: Color(red: 1, green: 0.29, blue: 0.31))
                             diffStat(value: "+5", color: Color(red: 0.11, green: 0.79, blue: 0.67))
