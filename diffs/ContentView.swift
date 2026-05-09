@@ -238,6 +238,18 @@ final class GutterTextView: NSTextView {
     }
 }
 
+final class GutterScrollView: NSScrollView {
+    weak var primaryScrollView: NSScrollView?
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let primaryScrollView else {
+            super.scrollWheel(with: event)
+            return
+        }
+        primaryScrollView.scrollWheel(with: event)
+    }
+}
+
 final class ScrollCoordinator {
     private struct Entry {
         weak var scrollView: NSScrollView?
@@ -351,7 +363,7 @@ struct SelectableCodeTextView: NSViewRepresentable {
         gutterMarkerView.drawsMarker = true
         gutterMarkerView.markerWidth = gutterMarkerWidth
 
-        let gutterMarkerScrollView = NSScrollView()
+        let gutterMarkerScrollView = GutterScrollView()
         gutterMarkerScrollView.borderType = .noBorder
         gutterMarkerScrollView.hasVerticalScroller = false
         gutterMarkerScrollView.hasHorizontalScroller = false
@@ -360,7 +372,7 @@ struct SelectableCodeTextView: NSViewRepresentable {
         gutterMarkerScrollView.documentView = gutterMarkerView
         gutterMarkerScrollView.translatesAutoresizingMaskIntoConstraints = false
 
-        let lineNumberScrollView = NSScrollView()
+        let lineNumberScrollView = GutterScrollView()
         lineNumberScrollView.borderType = .noBorder
         lineNumberScrollView.hasVerticalScroller = false
         lineNumberScrollView.hasHorizontalScroller = false
@@ -372,6 +384,8 @@ struct SelectableCodeTextView: NSViewRepresentable {
 
         scrollView.documentView = textView
         scrollView.translatesAutoresizingMaskIntoConstraints = false
+        gutterMarkerScrollView.primaryScrollView = scrollView
+        lineNumberScrollView.primaryScrollView = scrollView
         container.addSubview(gutterMarkerScrollView)
         container.addSubview(lineNumberScrollView)
         container.addSubview(scrollView)
